@@ -57,6 +57,18 @@ const (
 	UsersConfigFile = "users.json"
 )
 
+func convertDateToId(date time.Time) string {
+	//March 26, 2025 = 20173
+	//get the diff in days between march 26, 2006 and the date
+	baseId := 20173
+	baseDate := time.Date(2025, 3, 26, 0, 0, 0, 0, time.UTC)
+	daysDiff := date.Sub(baseDate).Hours() / 24
+
+	newId := baseId + int(daysDiff)
+
+	return fmt.Sprintf("%d", newId)
+}
+
 func LoadUsers() ([]User, error) {
 	configPath := filepath.Join(ConfigDir, UsersConfigFile)
 
@@ -135,9 +147,11 @@ func saveUserDataToJSON(user User, entry DiaryEntry) error {
 		return fmt.Errorf("failed to marshal JSON for %s: %v", user.Username, err)
 	}
 
+	entryDate, _ := time.Parse("02/01/2006", entry.Date)
+	entryDateStr := entryDate.Format("2006-01-02")
 	filename := filepath.Join(OutputDir, fmt.Sprintf("%s_%s.json",
 		user.Username,
-		time.Now().Format("02-01-2006")))
+		entryDateStr))
 
 	if err := os.WriteFile(filename, jsonData, 0644); err != nil {
 		return fmt.Errorf("failed to write JSON file for %s: %v", user.Username, err)
@@ -320,8 +334,73 @@ func extractDetailedDiaryEntry(doc *goquery.Document) DiaryEntry {
 	return entry
 }
 
-func getUserDiaryEntry(client *http.Client, user User) (DiaryEntry, error) {
-	foodDiaryURL := fmt.Sprintf("https://www.fatsecret.com.br/Diary.aspx?pa=fj&id=%s", user.ID)
+func getUserDiaryEntryMonth(client *http.Client, user User) ([]DiaryEntry, error) {
+	previous30Days := []time.Time{}
+
+	for i := range 30 {
+		previous30Days = append(previous30Days, time.Now().AddDate(0, 0, -i))
+	}
+
+	detailedEntries := []DiaryEntry{}
+	for _, date := range previous30Days {
+		filename := filepath.Join(OutputDir, fmt.Sprintf("%s_%s.json", user.Username, date.Format("2006-01-02")))
+
+		diaryEntry := readDiaryEntryFromFile(filename)
+
+		if diaryEntry != nil {
+			fmt.Printf("Found diary entry for %s in file: %s\n", user.Username, filename)
+			detailedEntries = append(detailedEntries, *diaryEntry)
+			continue
+		}
+
+		dateID := convertDateToId(date)
+		foodDiaryURL := fmt.Sprintf("https://www.fatsecret.com.br/Diary.aspx?pa=fj&id=%s&dt=%s", user.ID, dateID)
+		fmt.Printf("Accessing food journal for %s...\n", user.Username)
+
+		foodDiaryResp, err := client.Get(foodDiaryURL)
+		if err != nil {
+			return []DiaryEntry{}, err
+		}
+
+		defer foodDiaryResp.Body.Close()
+
+		foodDiaryDoc, err := goquery.NewDocumentFromReader(foodDiaryResp.Body)
+		if err != nil {
+			return []DiaryEntry{}, err
+		}
+
+		detailedEntry := extractDetailedDiaryEntry(foodDiaryDoc)
+		detailedEntry.Date = date.Format("02/01/2006")
+
+		fmt.Printf("\n----- Food diary for %s (%s) -----\n", user.Username, detailedEntry.Date)
+		fmt.Printf("Calories: %s\n", detailedEntry.Calories)
+		fmt.Printf("IDR: %s\n", detailedEntry.IDR)
+		fmt.Printf("Fat: %s g\n", detailedEntry.Fat)
+		fmt.Printf("Protein: %s g\n", detailedEntry.Protein)
+		fmt.Printf("Carbs: %s g\n", detailedEntry.Carbs)
+
+		fmt.Println("\nMeal summary:")
+		for _, meal := range detailedEntry.Meals {
+			fmt.Printf("- %s: %s cal, %d items\n", meal.Name, meal.Calories, len(meal.Items))
+		}
+		detailedEntries = append(detailedEntries, detailedEntry)
+	}
+
+	return detailedEntries, nil
+}
+
+func getUserDiaryEntry(client *http.Client, user User, date time.Time) (DiaryEntry, error) {
+	filename := filepath.Join(OutputDir, fmt.Sprintf("%s_%s.json", user.Username, date.Format("2006-01-02")))
+
+	diaryEntry := readDiaryEntryFromFile(filename)
+
+	if diaryEntry != nil {
+		fmt.Printf("Found diary entry for %s in file: %s\n", user.Username, filename)
+		return *diaryEntry, nil
+	}
+
+	dateID := convertDateToId(date)
+	foodDiaryURL := fmt.Sprintf("https://www.fatsecret.com.br/Diary.aspx?pa=fj&id=%s&dt=%s", user.ID, dateID)
 	fmt.Printf("Accessing food journal for %s...\n", user.Username)
 
 	foodDiaryResp, err := client.Get(foodDiaryURL)
@@ -336,6 +415,7 @@ func getUserDiaryEntry(client *http.Client, user User) (DiaryEntry, error) {
 	}
 
 	detailedEntry := extractDetailedDiaryEntry(foodDiaryDoc)
+	detailedEntry.Date = date.Format("02/01/2006")
 
 	fmt.Printf("\n----- Food diary for %s (%s) -----\n", user.Username, detailedEntry.Date)
 	fmt.Printf("Calories: %s\n", detailedEntry.Calories)
@@ -352,19 +432,29 @@ func getUserDiaryEntry(client *http.Client, user User) (DiaryEntry, error) {
 	return detailedEntry, nil
 }
 
-func ScrapeFatSecret(username, password string) map[string]DiaryEntry {
-	users, err := LoadUsers()
+func readDiaryEntryFromFile(filename string) *DiaryEntry {
+	file, err := os.ReadFile(filename)
 	if err != nil {
-		log.Fatalf("Error loading users config: %v", err)
+		fmt.Println("Error reading file:", err)
+		return nil
+	}
+	var entry struct {
+		User  User       `json:"user"`
+		Entry DiaryEntry `json:"entry"`
+	}
+	err = json.Unmarshal(file, &entry)
+	if err != nil {
+		fmt.Println("Error unmarshalling JSON:", err)
+		return nil
 	}
 
-	if len(users) == 0 {
-		log.Fatalf("No users found in configuration")
-	}
+	return &entry.Entry
+}
 
+func loginToFatSecret(username, password string) (*http.Client, error) {
 	jar, err := cookiejar.New(nil)
 	if err != nil {
-		log.Fatal(err)
+		return nil, fmt.Errorf("failed to create cookie jar: %v", err)
 	}
 
 	client := &http.Client{
@@ -376,15 +466,13 @@ func ScrapeFatSecret(username, password string) map[string]DiaryEntry {
 
 	resp, err := client.Get(loginPageURL)
 	if err != nil {
-		log.Fatal(err)
+		return nil, fmt.Errorf("failed to get login page: %v", err)
 	}
 	defer resp.Body.Close()
 
-	fmt.Println("Initial page status code:", resp.StatusCode)
-
 	doc, err := goquery.NewDocumentFromReader(resp.Body)
 	if err != nil {
-		log.Fatal(err)
+		return nil, fmt.Errorf("failed to parse login page: %v", err)
 	}
 
 	formData := extractFormData(doc)
@@ -399,19 +487,17 @@ func ScrapeFatSecret(username, password string) map[string]DiaryEntry {
 
 	loginReq, err := createLoginRequest(formData)
 	if err != nil {
-		log.Fatal(err)
+		return nil, fmt.Errorf("failed to create login request: %v", err)
 	}
 
 	loginResp, err := client.Do(loginReq)
 	if err != nil {
-		log.Fatal(err)
+		return nil, fmt.Errorf("login request failed: %v", err)
 	}
 	defer loginResp.Body.Close()
 
 	fmt.Println("Login response status code:", loginResp.StatusCode)
 	fmt.Println("Response URL:", loginResp.Request.URL.String())
-
-	userEntries := make(map[string]DiaryEntry)
 
 	if loginResp.StatusCode == 302 {
 		redirectURL := loginResp.Header.Get("Location")
@@ -420,48 +506,91 @@ func ScrapeFatSecret(username, password string) map[string]DiaryEntry {
 		if !strings.HasPrefix(redirectURL, "http") {
 			redirectURL = baseURL + redirectURL
 		}
+
 		fmt.Println("Full redirect URL:", redirectURL)
 
 		nextResp, err := client.Get(redirectURL)
 		if err != nil {
-			log.Fatal(err)
+			return nil, fmt.Errorf("failed to follow redirect: %v", err)
 		}
 		defer nextResp.Body.Close()
 
 		fmt.Println("Redirect response status code:", nextResp.StatusCode)
 		fmt.Println("After redirect URL:", nextResp.Request.URL.String())
 
+		// Return a client with the authenticated cookies
 		followClient := &http.Client{
 			Jar: jar,
 		}
 
-		fmt.Println("\nAccessing food diary pages...")
-		for _, user := range users {
-			entry, err := getUserDiaryEntry(followClient, user)
-			if err != nil {
-				fmt.Printf("Error getting diary for %s: %v\n", user.Username, err)
-				continue
-			}
+		return followClient, nil
+	}
 
+	return nil, fmt.Errorf("login failed - no redirect detected")
+}
+
+func ScrapeFatSecret(username, password string, users []User, date ...time.Time) map[string][]DiaryEntry {
+	if len(users) == 0 {
+		return make(map[string][]DiaryEntry)
+	}
+
+	client, err := loginToFatSecret(username, password)
+	if err != nil {
+		log.Fatalf("Failed to login: %v", err)
+	}
+
+	userEntries := make(map[string][]DiaryEntry)
+
+	fmt.Println("\nAccessing food diary pages...")
+	for _, user := range users {
+
+		entries := []DiaryEntry{}
+		entry := DiaryEntry{}
+		err := error(nil)
+
+		if len(date) > 0 {
+			entry, err = getUserDiaryEntry(client, user, date[0])
+		} else {
+			entries, err = getUserDiaryEntryMonth(client, user)
+		}
+
+		if err != nil {
+			fmt.Printf("Error getting diary for %s: %v\n", user.Username, err)
+			continue
+		}
+
+		if len(date) > 0 {
 			if entry.Date != "" {
-				userEntries[user.Username] = entry
+				userEntries[user.Username] = append(userEntries[user.Username], entry)
 
 				if err := saveUserDataToJSON(user, entry); err != nil {
 					fmt.Println(err)
 				}
 			}
-		}
+		} else {
+			for _, entry := range entries {
+				if entry.Date != "" {
+					userEntries[user.Username] = append(userEntries[user.Username], entry)
 
-		fmt.Println("\nLogin and data extraction successful!")
-	} else {
-		fmt.Println("Login failed - no redirect detected")
+					if err := saveUserDataToJSON(user, entry); err != nil {
+						fmt.Println(err)
+					}
+				}
+			}
+		}
 	}
 
+	fmt.Println("\nLogin and data extraction successful!")
 	return userEntries
 }
 
 func RunScraper(username, password string) {
-	entries := ScrapeFatSecret(username, password)
+	users, err := LoadUsers()
+	if err != nil {
+		log.Fatalf("Failed to load users: %v", err)
+	}
+
+	entries := ScrapeFatSecret(username, password, users)
 
 	fmt.Printf("\nSummary: Retrieved entries for %d users\n", len(entries))
 	fmt.Printf("JSON files saved in the '%s' directory\n", OutputDir)

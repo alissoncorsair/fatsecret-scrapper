@@ -6,18 +6,18 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"path/filepath"
+	"time"
 
 	"github.com/alissoncorsair/fatsecret-scrapper/scraper"
 	_ "github.com/joho/godotenv/autoload"
 )
 
 func main() {
-	http.HandleFunc("GET /api/scrape", scrapeHandler)
+	//http.HandleFunc("GET /api/scrape", scrapeHandler)
 	http.HandleFunc("GET /api/users", getUsersHandler)
 	http.HandleFunc("POST /api/users", addUserHandler)
-	http.HandleFunc("GET /api/diary/{username}", getDiaryHandler)
-	http.HandleFunc("GET /api/diary/{username}/{date}", getDiaryHandler) //DD/MM/YYYY
+	http.HandleFunc("GET /api/diary", getDiaryHandler)
+	http.HandleFunc("GET /api/diary/{username}/{id}", getDiaryHandler)
 
 	port := os.Getenv("PORT")
 	if port == "" {
@@ -28,7 +28,7 @@ func main() {
 	log.Fatal(http.ListenAndServe(":"+port, nil))
 }
 
-func scrapeHandler(w http.ResponseWriter, r *http.Request) {
+/* func scrapeHandler(w http.ResponseWriter, r *http.Request) {
 	username := os.Getenv("FATSECRET_LOGIN")
 	password := os.Getenv("FATSECRET_PASSWORD")
 
@@ -46,7 +46,7 @@ func scrapeHandler(w http.ResponseWriter, r *http.Request) {
 		"message": fmt.Sprintf("Scraped data for %d users", len(entries)),
 		"count":   len(entries),
 	})
-}
+} */
 
 func addUserHandler(w http.ResponseWriter, r *http.Request) {
 	var newUser scraper.User
@@ -98,53 +98,37 @@ func getUsersHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func getDiaryHandler(w http.ResponseWriter, r *http.Request) {
-	username := r.URL.Query().Get("username")
+	login := os.Getenv("FATSECRET_LOGIN")
+	password := os.Getenv("FATSECRET_PASSWORD")
+	username := r.PathValue("username")
+	fmt.Println("username", username)
+	id := r.PathValue("id")
 	date := r.URL.Query().Get("date")
 
+	var user = scraper.User{
+		Username: username,
+		ID:       id,
+	}
+
 	if date == "" {
-		files, err := filepath.Glob(filepath.Join(scraper.OutputDir, username+"_*.json"))
-		if err != nil {
-			http.Error(w, "Error reading diaries", http.StatusInternalServerError)
-			return
-		}
-
-		if len(files) == 0 {
-			http.Error(w, "No diary entries found for this user", http.StatusNotFound)
-			return
-		}
-
-		latest := files[0]
-		for _, file := range files {
-			if file > latest {
-				latest = file
-			}
-		}
-
-		data, err := os.ReadFile(latest)
-		if err != nil {
-			http.Error(w, "Error reading diary", http.StatusInternalServerError)
-			return
-		}
+		diaries := scraper.ScrapeFatSecret(login, password, []scraper.User{user})
 
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		w.Write(data)
+		json.NewEncoder(w).Encode(diaries)
 		return
 	}
 
-	filename := filepath.Join(scraper.OutputDir, fmt.Sprintf("%s_%s.json", username, date))
-	if _, err := os.Stat(filename); os.IsNotExist(err) {
-		http.Error(w, "Diary entry not found", http.StatusNotFound)
-		return
-	}
-
-	data, err := os.ReadFile(filename)
+	convertedDate, err := time.Parse("02/01/2006", date)
+	fmt.Println("date", date)
+	fmt.Println("convertedDate", convertedDate)
 	if err != nil {
-		http.Error(w, "Error reading diary", http.StatusInternalServerError)
+		http.Error(w, "Invalid date format. Use DD/MM/YYYY", http.StatusBadRequest)
 		return
 	}
+	diaries := scraper.ScrapeFatSecret(login, password, []scraper.User{user}, convertedDate)
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	w.Write(data)
+	json.NewEncoder(w).Encode(diaries)
 }
