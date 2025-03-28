@@ -9,7 +9,9 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/PuerkitoBio/goquery"
@@ -341,50 +343,73 @@ func getUserDiaryEntryMonth(client *http.Client, user User) ([]DiaryEntry, error
 		previous30Days = append(previous30Days, time.Now().AddDate(0, 0, -i))
 	}
 
+	var mu sync.Mutex
 	detailedEntries := []DiaryEntry{}
+	var wg sync.WaitGroup
+
 	for _, date := range previous30Days {
-		filename := filepath.Join(OutputDir, fmt.Sprintf("%s_%s.json", user.Username, date.Format("2006-01-02")))
+		wg.Add(1)
 
-		diaryEntry := readDiaryEntryFromFile(filename)
+		go func() {
+			defer wg.Done()
+			filename := filepath.Join(OutputDir, fmt.Sprintf("%s_%s.json", user.Username, date.Format("2006-01-02")))
 
-		if diaryEntry != nil {
-			fmt.Printf("Found diary entry for %s in file: %s\n", user.Username, filename)
-			detailedEntries = append(detailedEntries, *diaryEntry)
-			continue
-		}
+			diaryEntry := readDiaryEntryFromFile(filename)
 
-		dateID := convertDateToId(date)
-		foodDiaryURL := fmt.Sprintf("https://www.fatsecret.com.br/Diary.aspx?pa=fj&id=%s&dt=%s", user.ID, dateID)
-		fmt.Printf("Accessing food journal for %s...\n", user.Username)
+			if diaryEntry != nil {
+				fmt.Printf("Found diary entry for %s in file: %s\n", user.Username, filename)
+				mu.Lock()
+				detailedEntries = append(detailedEntries, *diaryEntry)
+				mu.Unlock()
+				return
+			}
 
-		foodDiaryResp, err := client.Get(foodDiaryURL)
-		if err != nil {
-			return []DiaryEntry{}, err
-		}
+			dateID := convertDateToId(date)
+			foodDiaryURL := fmt.Sprintf("https://www.fatsecret.com.br/Diary.aspx?pa=fj&id=%s&dt=%s", user.ID, dateID)
+			fmt.Printf("Accessing food journal for %s...\n", user.Username)
 
-		defer foodDiaryResp.Body.Close()
+			foodDiaryResp, err := client.Get(foodDiaryURL)
+			if err != nil {
+				fmt.Printf("Error accessing food diary for %s: %v\n", user.Username, err)
+				return
+			}
 
-		foodDiaryDoc, err := goquery.NewDocumentFromReader(foodDiaryResp.Body)
-		if err != nil {
-			return []DiaryEntry{}, err
-		}
+			defer foodDiaryResp.Body.Close()
 
-		detailedEntry := extractDetailedDiaryEntry(foodDiaryDoc)
-		detailedEntry.Date = date.Format("02/01/2006")
+			foodDiaryDoc, err := goquery.NewDocumentFromReader(foodDiaryResp.Body)
+			if err != nil {
+				fmt.Printf("Error parsing food diary for %s: %v\n", user.Username, err)
+				return
+			}
 
-		fmt.Printf("\n----- Food diary for %s (%s) -----\n", user.Username, detailedEntry.Date)
-		fmt.Printf("Calories: %s\n", detailedEntry.Calories)
-		fmt.Printf("IDR: %s\n", detailedEntry.IDR)
-		fmt.Printf("Fat: %s g\n", detailedEntry.Fat)
-		fmt.Printf("Protein: %s g\n", detailedEntry.Protein)
-		fmt.Printf("Carbs: %s g\n", detailedEntry.Carbs)
+			detailedEntry := extractDetailedDiaryEntry(foodDiaryDoc)
+			detailedEntry.Date = date.Format("02/01/2006")
 
-		fmt.Println("\nMeal summary:")
-		for _, meal := range detailedEntry.Meals {
-			fmt.Printf("- %s: %s cal, %d items\n", meal.Name, meal.Calories, len(meal.Items))
-		}
-		detailedEntries = append(detailedEntries, detailedEntry)
+			fmt.Printf("\n----- Food diary for %s (%s) -----\n", user.Username, detailedEntry.Date)
+			fmt.Printf("Calories: %s\n", detailedEntry.Calories)
+			fmt.Printf("IDR: %s\n", detailedEntry.IDR)
+			fmt.Printf("Fat: %s g\n", detailedEntry.Fat)
+			fmt.Printf("Protein: %s g\n", detailedEntry.Protein)
+			fmt.Printf("Carbs: %s g\n", detailedEntry.Carbs)
+
+			fmt.Println("\nMeal summary:")
+			for _, meal := range detailedEntry.Meals {
+				fmt.Printf("- %s: %s cal, %d items\n", meal.Name, meal.Calories, len(meal.Items))
+			}
+
+			mu.Lock()
+			detailedEntries = append(detailedEntries, detailedEntry)
+			mu.Unlock()
+		}()
 	}
+
+	wg.Wait()
+
+	slices.SortFunc(detailedEntries, func(a, b DiaryEntry) int {
+		aDate, _ := time.Parse("02/01/2006", a.Date)
+		bDate, _ := time.Parse("02/01/2006", b.Date)
+		return -aDate.Compare(bDate)
+	})
 
 	return detailedEntries, nil
 }
@@ -539,46 +564,59 @@ func ScrapeFatSecret(username, password string, users []User, date ...time.Time)
 		log.Fatalf("Failed to login: %v", err)
 	}
 
+	var wg sync.WaitGroup
+	var mu sync.Mutex
 	userEntries := make(map[string][]DiaryEntry)
 
 	fmt.Println("\nAccessing food diary pages...")
 	for _, user := range users {
+		wg.Add(1)
+		go func(user User) {
+			defer wg.Done()
+			if len(date) > 0 {
+				entry, err := getUserDiaryEntry(client, user, date[0])
 
-		entries := []DiaryEntry{}
-		entry := DiaryEntry{}
-		err := error(nil)
-
-		if len(date) > 0 {
-			entry, err = getUserDiaryEntry(client, user, date[0])
-		} else {
-			entries, err = getUserDiaryEntryMonth(client, user)
-		}
-
-		if err != nil {
-			fmt.Printf("Error getting diary for %s: %v\n", user.Username, err)
-			continue
-		}
-
-		if len(date) > 0 {
-			if entry.Date != "" {
-				userEntries[user.Username] = append(userEntries[user.Username], entry)
-
-				if err := saveUserDataToJSON(user, entry); err != nil {
-					fmt.Println(err)
+				if err != nil {
+					fmt.Printf("Error getting diary for %s: %v\n", user.Username, err)
 				}
-			}
-		} else {
-			for _, entry := range entries {
-				if entry.Date != "" {
-					userEntries[user.Username] = append(userEntries[user.Username], entry)
 
+				if entry.Date != "" {
+					mu.Lock()
+					userEntries[user.Username] = append(userEntries[user.Username], entry)
+					mu.Unlock()
 					if err := saveUserDataToJSON(user, entry); err != nil {
 						fmt.Println(err)
 					}
 				}
+			} else {
+				entries, err := getUserDiaryEntryMonth(client, user)
+
+				if err != nil {
+					fmt.Printf("Error getting diary for %s: %v\n", user.Username, err)
+					return
+				}
+
+				for _, entry := range entries {
+					if entry.Date != "" {
+						mu.Lock()
+						userEntries[user.Username] = append(userEntries[user.Username], entry)
+						mu.Unlock()
+
+						if err := saveUserDataToJSON(user, entry); err != nil {
+							fmt.Println(err)
+						}
+					}
+				}
 			}
-		}
+
+			if err != nil {
+				fmt.Printf("Error getting diary for %s: %v\n", user.Username, err)
+				return
+			}
+		}(user)
 	}
+
+	wg.Wait()
 
 	fmt.Println("\nLogin and data extraction successful!")
 	return userEntries
